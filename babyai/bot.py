@@ -251,7 +251,9 @@ class DropSubgoal(Subgoal):
 
     def replan_before_action(self):
         assert self.bot.mission.carrying
-        assert not self.fwd_cell
+        #assert not self.fwd_cell
+        if self.fwd_cell:
+            assert self.fwd_cell.type == "floor"
         return self.actions.drop
 
     def replan_after_action(self, action_taken):
@@ -327,7 +329,15 @@ class GoNextToSubgoal(Subgoal):
         # -> Move away from it
         if manhattan_distance(target_pos, self.pos) == (1 if self.reason == 'PutNext' else 0):
             def steppable(cell):
-                return cell is None or (cell.type == 'door' and cell.is_open)
+                if cell is None:
+                    return True
+                elif cell.type =="door" and cell.is_open:
+                    return True
+                elif cell.type == "floor" and self.bot.mission.color_property_map[cell.color] is not "trap":
+                    return True
+                else:
+                    return False
+                #return cell is None or (cell.type == 'door' and cell.is_open)
             if steppable(self.fwd_cell):
                 return self.actions.forward
             if steppable(self.bot.mission.grid.get(*(self.pos + self.right_vec))):
@@ -350,6 +360,9 @@ class GoNextToSubgoal(Subgoal):
                     # the bot to move the target object.
                     self.bot.stack.append(GoNextToSubgoal(
                         self.bot, self.fwd_pos + 2 * self.dir_vec))
+                    return
+                if self.fwd_cell.type == 'floor':
+                    self.bot.stack.pop()
                     return
         else:
             if np.array_equal(target_pos, self.fwd_pos):
@@ -392,6 +405,9 @@ class GoNextToSubgoal(Subgoal):
                         return
                     else:
                         return self.actions.forward
+                if self.fwd_cell.type == "floor":
+                    assert self.bot.mission.color_property_map[self.fwd_cell.color] != "trap"
+                    return self.actions.forward
                 if self.carrying:
                     drop_pos_cur = self.bot._find_drop_pos()
                     drop_pos_block = self.bot._find_drop_pos(drop_pos_cur)
@@ -544,6 +560,9 @@ class Bot:
         # performed by this bot
         self.bfs_step_counter = 0
 
+        self.execute_flip_ud = False
+        self.flip_ud_step = 0
+
     def replan(self, action_taken=None):
         """Replan and suggest an action.
 
@@ -568,6 +587,15 @@ class Bot:
         # Check that no box has been opened
         self._check_erroneous_box_opening(action_taken)
 
+        if self.execute_flip_ud:
+            flipud_actions = [self.mission.Actions.left, self.mission.Actions.forward]
+            suggested_action = flipud_actions[self.flip_ud_step]
+            if self.flip_ud_step == 1:
+                self.execute_flip_ud = False
+                self.flip_ud_step = 0
+            else:
+                self.flip_ud_step += 1
+            return suggested_action
         # TODO: instead of updating all subgoals, just add a couple
         # properties to the `Subgoal` class.
         for subgoal in self.stack:
@@ -593,7 +621,19 @@ class Bot:
             suggested_action = self.mission.actions.done
 
         self._remember_current_state()
-
+        pos = self.mission.agent_pos
+        cell = self.mission.grid.get(*pos)
+        if cell is not None:
+            if cell.type == "floor":
+                assert cell.color in self.mission.color_property_map
+                if self.mission.color_property_map[cell.color] == "fliplr":
+                    if suggested_action == self.mission.Actions.left:
+                        suggested_action = self.mission.Actions.right
+                    elif suggested_action == self.mission.Actions.right:
+                        suggested_action = self.mission.Actions.left
+                if self.mission.color_property_map[cell.color] == "flipud" and suggested_action == self.mission.Actions.forward:
+                    self.execute_flip_ud = True
+                    suggested_action = self.mission.Actions.left
         return suggested_action
 
     def _find_obj_pos(self, obj_desc, adjacent=False):
@@ -746,6 +786,8 @@ class Bot:
             # If this cell was not visually observed, don't expand from it
             if not self.vis_mask[i, j]:
                 continue
+            # TODO: add floor cell handling for the bot. self.mission.color_property_map
+            # has property, cell.color has color
 
             if cell:
                 if cell.type == 'wall':
@@ -754,6 +796,11 @@ class Bot:
                 elif cell.type == 'door':
                     # If the door is closed, don't visit neighbors
                     if not cell.is_open:
+                        continue
+                elif cell.type == "floor":
+                    assert "color_property_map" in self.mission.__dict__
+                    floor_property = self.mission.color_property_map[cell.color]
+                    if floor_property == "trap":
                         continue
                 elif not ignore_blockers:
                     continue
@@ -827,7 +874,11 @@ class Bot:
                 return False
 
             if not self.vis_mask[i, j] or grid.get(i, j):
-                return False
+                ccell = grid.get(i, j)
+                if ccell.type == "floor":
+                    pass
+                else:
+                    return False
 
             # We distinguish cells of three classes:
             # class 0: the empty ones, including open doors
@@ -838,17 +889,29 @@ class Bot:
             # We want to ensure that empty cells are connected, and that one can reach
             # any object cell from any other object cell.
             cell_class = []
+
+
             for k, l in [(-1, -1), (0, -1), (1, -1), (1, 0),
                          (1, 1), (0, 1), (-1, 1), (-1, 0)]:
                 nb_pos = (i + k, j + l)
                 cell = grid.get(*nb_pos)
+                #TODO: add cell type 'floor' to allowable drop positions
                 # compeletely blocked
-                if self.vis_mask[nb_pos] and cell and cell.type == 'wall':
-                    cell_class.append(1)
+                if self.vis_mask[nb_pos] and cell and (cell.type in ['wall', 'floor']):
+                    if cell.type == "wall":
+                        cell_class.append(1)
+                    elif cell.type == 'floor':
+                        if "color_property_map" in self.mission.__dict__:
+                            floor_property = self.mission.color_property_map[cell.color]
+                            if floor_property == "trap":
+                                cell_class.append(1)
+                            else:
+                                cell_class.append(0)
                 # empty
                 elif (self.vis_mask[nb_pos]
                         and (not cell or (cell.type == 'door' and cell.is_open) or nb_pos == agent_pos)
                         and nb_pos != except_pos):
+
                     cell_class.append(0)
                 # an object cell
                 else:
@@ -880,7 +943,11 @@ class Bot:
                 return False
 
             if not self.vis_mask[pos] or grid.get(*pos):
-                return False
+                ccell = grid.get(*pos)
+                if ccell.type == "floor":
+                    pass
+                else:
+                    return False
 
             return True
 
